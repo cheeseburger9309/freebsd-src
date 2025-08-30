@@ -127,6 +127,7 @@ static zfs_range_tree_t *mos_refd_objs;
 static spa_t *spa;
 static objset_t *os;
 static boolean_t kernel_init_done;
+static boolean_t corruption_found = B_FALSE;
 
 static void snprintf_blkptr_compact(char *, size_t, const blkptr_t *,
     boolean_t);
@@ -176,7 +177,7 @@ static int
 sublivelist_verify_blkptr(void *arg, const blkptr_t *bp, boolean_t free,
     dmu_tx_t *tx)
 {
-	ASSERT3P(tx, ==, NULL);
+	ASSERT0P(tx);
 	struct sublivelist_verify *sv = arg;
 	sublivelist_verify_block_refcnt_t current = {
 			.svbr_blk = *bp,
@@ -250,6 +251,7 @@ sublivelist_verify_func(void *args, dsl_deadlist_entry_t *dle)
 		    &e->svbr_blk, B_TRUE);
 		(void) printf("\tERROR: %d unmatched FREE(s): %s\n",
 		    e->svbr_refcnt, blkbuf);
+		corruption_found = B_TRUE;
 	}
 	zfs_btree_destroy(&sv->sv_pair);
 
@@ -405,6 +407,7 @@ verify_livelist_allocs(metaslab_verify_t *mv, uint64_t txg,
 			    (u_longlong_t)DVA_GET_ASIZE(&found->svb_dva),
 			    (u_longlong_t)found->svb_allocated_txg,
 			    (u_longlong_t)txg);
+			corruption_found = B_TRUE;
 		}
 	}
 }
@@ -426,6 +429,7 @@ metaslab_spacemap_validation_cb(space_map_entry_t *sme, void *arg)
 			    (u_longlong_t)txg, (u_longlong_t)offset,
 			    (u_longlong_t)size, (u_longlong_t)mv->mv_vdid,
 			    (u_longlong_t)mv->mv_msid);
+			corruption_found = B_TRUE;
 		} else {
 			zfs_range_tree_add(mv->mv_allocated,
 			    offset, size);
@@ -439,6 +443,7 @@ metaslab_spacemap_validation_cb(space_map_entry_t *sme, void *arg)
 			    (u_longlong_t)txg, (u_longlong_t)offset,
 			    (u_longlong_t)size, (u_longlong_t)mv->mv_vdid,
 			    (u_longlong_t)mv->mv_msid);
+			corruption_found = B_TRUE;
 		} else {
 			zfs_range_tree_remove(mv->mv_allocated,
 			    offset, size);
@@ -526,6 +531,7 @@ mv_populate_livelist_allocs(metaslab_verify_t *mv, sublivelist_verify_t *sv)
 			    (u_longlong_t)DVA_GET_VDEV(&svb->svb_dva),
 			    (u_longlong_t)DVA_GET_OFFSET(&svb->svb_dva),
 			    (u_longlong_t)DVA_GET_ASIZE(&svb->svb_dva));
+			corruption_found = B_TRUE;
 			continue;
 		}
 
@@ -542,6 +548,7 @@ mv_populate_livelist_allocs(metaslab_verify_t *mv, sublivelist_verify_t *sv)
 			    (u_longlong_t)DVA_GET_VDEV(&svb->svb_dva),
 			    (u_longlong_t)DVA_GET_OFFSET(&svb->svb_dva),
 			    (u_longlong_t)DVA_GET_ASIZE(&svb->svb_dva));
+			corruption_found = B_TRUE;
 			continue;
 		}
 
@@ -655,6 +662,7 @@ livelist_metaslab_validate(spa_t *spa)
 	}
 	(void) printf("ERROR: Found livelist blocks marked as allocated "
 	    "for indirect vdevs:\n");
+	corruption_found = B_TRUE;
 
 	zfs_btree_index_t *where = NULL;
 	sublivelist_verify_block_t *svb;
@@ -827,7 +835,7 @@ usage(void)
 	(void) fprintf(stderr, "Specify an option more than once (e.g. -bb) "
 	    "to make only that option verbose\n");
 	(void) fprintf(stderr, "Default is to dump everything non-verbosely\n");
-	zdb_exit(1);
+	zdb_exit(2);
 }
 
 static void
@@ -892,9 +900,9 @@ dump_packed_nvlist(objset_t *os, uint64_t object, void *data, size_t size)
 	size_t nvsize = *(uint64_t *)data;
 	char *packed = umem_alloc(nvsize, UMEM_NOFAIL);
 
-	VERIFY(0 == dmu_read(os, object, 0, nvsize, packed, DMU_READ_PREFETCH));
+	VERIFY0(dmu_read(os, object, 0, nvsize, packed, DMU_READ_PREFETCH));
 
-	VERIFY(nvlist_unpack(packed, nvsize, &nv, 0) == 0);
+	VERIFY0(nvlist_unpack(packed, nvsize, &nv, 0));
 
 	umem_free(packed, nvsize);
 
@@ -1455,8 +1463,8 @@ get_obsolete_refcount(vdev_t *vd)
 			refcount++;
 		}
 	} else {
-		ASSERT3P(vd->vdev_obsolete_sm, ==, NULL);
-		ASSERT3U(obsolete_sm_object, ==, 0);
+		ASSERT0P(vd->vdev_obsolete_sm);
+		ASSERT0(obsolete_sm_object);
 	}
 	for (unsigned c = 0; c < vd->vdev_children; c++) {
 		refcount += get_obsolete_refcount(vd->vdev_child[c]);
@@ -1578,9 +1586,8 @@ dump_spacemap(objset_t *os, space_map_t *sm)
 			continue;
 		}
 
-		uint8_t words;
 		char entry_type;
-		uint64_t entry_off, entry_run, entry_vdev = SM_NO_VDEVID;
+		uint64_t entry_off, entry_run, entry_vdev;
 
 		if (sm_entry_is_single_word(word)) {
 			entry_type = (SM_TYPE_DECODE(word) == SM_ALLOC) ?
@@ -1588,18 +1595,23 @@ dump_spacemap(objset_t *os, space_map_t *sm)
 			entry_off = (SM_OFFSET_DECODE(word) << mapshift) +
 			    sm->sm_start;
 			entry_run = SM_RUN_DECODE(word) << mapshift;
-			words = 1;
+
+			(void) printf("\t    [%6llu] %c "
+			    "range: %012llx-%012llx size: %08llx\n",
+			    (u_longlong_t)entry_id, entry_type,
+			    (u_longlong_t)entry_off,
+			    (u_longlong_t)(entry_off + entry_run - 1),
+			    (u_longlong_t)entry_run);
 		} else {
 			/* it is a two-word entry so we read another word */
 			ASSERT(sm_entry_is_double_word(word));
 
 			uint64_t extra_word;
 			offset += sizeof (extra_word);
+			ASSERT3U(offset, <, space_map_length(sm));
 			VERIFY0(dmu_read(os, space_map_object(sm), offset,
 			    sizeof (extra_word), &extra_word,
 			    DMU_READ_PREFETCH));
-
-			ASSERT3U(offset, <=, space_map_length(sm));
 
 			entry_run = SM2_RUN_DECODE(word) << mapshift;
 			entry_vdev = SM2_VDEV_DECODE(word);
@@ -1607,16 +1619,19 @@ dump_spacemap(objset_t *os, space_map_t *sm)
 			    'A' : 'F';
 			entry_off = (SM2_OFFSET_DECODE(extra_word) <<
 			    mapshift) + sm->sm_start;
-			words = 2;
-		}
 
-		(void) printf("\t    [%6llu]    %c  range:"
-		    " %010llx-%010llx  size: %06llx vdev: %06llu words: %u\n",
-		    (u_longlong_t)entry_id,
-		    entry_type, (u_longlong_t)entry_off,
-		    (u_longlong_t)(entry_off + entry_run),
-		    (u_longlong_t)entry_run,
-		    (u_longlong_t)entry_vdev, words);
+			if (zopt_metaslab_args == 0 ||
+			    zopt_metaslab[0] == entry_vdev) {
+				(void) printf("\t    [%6llu] %c "
+				    "range: %012llx-%012llx size: %08llx "
+				    "vdev: %llu\n",
+				    (u_longlong_t)entry_id, entry_type,
+				    (u_longlong_t)entry_off,
+				    (u_longlong_t)(entry_off + entry_run - 1),
+				    (u_longlong_t)entry_run,
+				    (u_longlong_t)entry_vdev);
+			}
+		}
 
 		if (entry_type == 'A')
 			alloc += entry_run;
@@ -1792,7 +1807,7 @@ print_vdev_indirect(vdev_t *vd)
 	vdev_indirect_births_t *vib = vd->vdev_indirect_births;
 
 	if (vim == NULL) {
-		ASSERT3P(vib, ==, NULL);
+		ASSERT0P(vib);
 		return;
 	}
 
@@ -1865,7 +1880,7 @@ dump_metaslabs(spa_t *spa)
 
 	(void) printf("\nMetaslabs:\n");
 
-	if (!dump_opt['d'] && zopt_metaslab_args > 0) {
+	if (zopt_metaslab_args > 0) {
 		c = zopt_metaslab[0];
 
 		if (c >= children)
@@ -2043,10 +2058,10 @@ dump_ddt_object(ddt_t *ddt, ddt_type_t type, ddt_class_t class)
 
 	if (error == ENOENT)
 		return;
-	ASSERT(error == 0);
+	ASSERT0(error);
 
 	error = ddt_object_count(ddt, type, class, &count);
-	ASSERT(error == 0);
+	ASSERT0(error);
 	if (count == 0)
 		return;
 
@@ -2583,19 +2598,17 @@ snprintf_blkptr_compact(char *blkbuf, size_t buflen, const blkptr_t *bp,
 	}
 }
 
-static void
+static u_longlong_t
 print_indirect(spa_t *spa, blkptr_t *bp, const zbookmark_phys_t *zb,
     const dnode_phys_t *dnp)
 {
 	char blkbuf[BP_SPRINTF_LEN];
+	u_longlong_t offset;
 	int l;
 
-	if (!BP_IS_EMBEDDED(bp)) {
-		ASSERT3U(BP_GET_TYPE(bp), ==, dnp->dn_type);
-		ASSERT3U(BP_GET_LEVEL(bp), ==, zb->zb_level);
-	}
+	offset = (u_longlong_t)blkid2offset(dnp, bp, zb);
 
-	(void) printf("%16llx ", (u_longlong_t)blkid2offset(dnp, bp, zb));
+	(void) printf("%16llx ", offset);
 
 	ASSERT(zb->zb_level >= 0);
 
@@ -2610,19 +2623,38 @@ print_indirect(spa_t *spa, blkptr_t *bp, const zbookmark_phys_t *zb,
 	snprintf_blkptr_compact(blkbuf, sizeof (blkbuf), bp, B_FALSE);
 	if (dump_opt['Z'] && BP_GET_COMPRESS(bp) == ZIO_COMPRESS_ZSTD)
 		snprintf_zstd_header(spa, blkbuf, sizeof (blkbuf), bp);
-	(void) printf("%s\n", blkbuf);
+	(void) printf("%s", blkbuf);
+
+	if (!BP_IS_EMBEDDED(bp)) {
+		if (BP_GET_TYPE(bp) != dnp->dn_type) {
+			(void) printf(" (ERROR: Block pointer type "
+			    "(%llu) does not match dnode type (%hhu))",
+			    BP_GET_TYPE(bp), dnp->dn_type);
+			corruption_found = B_TRUE;
+		}
+		if (BP_GET_LEVEL(bp) != zb->zb_level) {
+			(void) printf(" (ERROR: Block pointer level "
+			    "(%llu) does not match bookmark level (%lld))",
+			    BP_GET_LEVEL(bp), (u_longlong_t)zb->zb_level);
+			corruption_found = B_TRUE;
+		}
+	}
+	(void) printf("\n");
+
+	return (offset);
 }
 
 static int
 visit_indirect(spa_t *spa, const dnode_phys_t *dnp,
     blkptr_t *bp, const zbookmark_phys_t *zb)
 {
+	u_longlong_t offset;
 	int err = 0;
 
 	if (BP_GET_BIRTH(bp) == 0)
 		return (0);
 
-	print_indirect(spa, bp, zb, dnp);
+	offset = print_indirect(spa, bp, zb, dnp);
 
 	if (BP_GET_LEVEL(bp) > 0 && !BP_IS_HOLE(bp)) {
 		arc_flags_t flags = ARC_FLAG_WAIT;
@@ -2652,8 +2684,15 @@ visit_indirect(spa_t *spa, const dnode_phys_t *dnp,
 				break;
 			fill += BP_GET_FILL(cbp);
 		}
-		if (!err)
-			ASSERT3U(fill, ==, BP_GET_FILL(bp));
+		if (!err) {
+			if (fill != BP_GET_FILL(bp)) {
+				(void) printf("%16llx: Block pointer "
+				    "fill (%llu) does not match calculated "
+				    "value (%llu)\n", offset, BP_GET_FILL(bp),
+				    (u_longlong_t)fill);
+				corruption_found = B_TRUE;
+			}
+		}
 		arc_buf_destroy(buf, &buf);
 	}
 
@@ -2909,6 +2948,7 @@ dump_full_bpobj(bpobj_t *bpo, const char *name, int indent)
 				(void) printf("ERROR %u while trying to open "
 				    "subobj id %llu\n",
 				    error, (u_longlong_t)subobj);
+				corruption_found = B_TRUE;
 				continue;
 			}
 			dump_full_bpobj(&subbpo, "subobj", indent + 1);
@@ -3088,6 +3128,7 @@ bpobj_count_refd(bpobj_t *bpo)
 				(void) printf("ERROR %u while trying to open "
 				    "subobj id %llu\n",
 				    error, (u_longlong_t)subobj);
+				corruption_found = B_TRUE;
 				continue;
 			}
 			bpobj_count_refd(&subbpo);
@@ -3109,7 +3150,7 @@ dsl_deadlist_entry_count_refd(void *arg, dsl_deadlist_entry_t *dle)
 static int
 dsl_deadlist_entry_dump(void *arg, dsl_deadlist_entry_t *dle)
 {
-	ASSERT(arg == NULL);
+	ASSERT0P(arg);
 	if (dump_opt['d'] >= 5) {
 		char buf[128];
 		(void) snprintf(buf, sizeof (buf),
@@ -3347,7 +3388,7 @@ open_objset(const char *path, const void *tag, objset_t **osp)
 	uint64_t sa_attrs = 0;
 	uint64_t version = 0;
 
-	VERIFY3P(sa_os, ==, NULL);
+	VERIFY0P(sa_os);
 
 	/*
 	 * We can't own an objset if it's redacted.  Therefore, we do this
@@ -3520,8 +3561,8 @@ dump_uidgid(objset_t *os, uint64_t uid, uint64_t gid)
 		uint64_t fuid_obj;
 
 		/* first find the fuid object.  It lives in the master node */
-		VERIFY(zap_lookup(os, MASTER_NODE_OBJ, ZFS_FUID_TABLES,
-		    8, 1, &fuid_obj) == 0);
+		VERIFY0(zap_lookup(os, MASTER_NODE_OBJ, ZFS_FUID_TABLES,
+		    8, 1, &fuid_obj));
 		zfs_fuid_avl_tree_create(&idx_tree, &domain_tree);
 		(void) zfs_fuid_table_load(os, fuid_obj,
 		    &idx_tree, &domain_tree);
@@ -7016,7 +7057,7 @@ deleted_livelists_count_blocks(spa_t *spa, zdb_cb_t *zbc)
 static void
 dump_livelist_cb(dsl_deadlist_t *ll, void *arg)
 {
-	ASSERT3P(arg, ==, NULL);
+	ASSERT0P(arg);
 	global_feature_count[SPA_FEATURE_LIVELIST]++;
 	dump_blkptr_list(ll, "Deleted Livelist");
 	dsl_deadlist_iterate(ll, sublivelist_verify_lightweight, NULL);
@@ -7913,7 +7954,7 @@ verify_checkpoint_vdev_spacemaps(spa_t *checkpoint, spa_t *current)
 		for (uint64_t c = ckpoint_rvd->vdev_children;
 		    c < current_rvd->vdev_children; c++) {
 			vdev_t *current_vd = current_rvd->vdev_child[c];
-			VERIFY3P(current_vd->vdev_checkpoint_sm, ==, NULL);
+			VERIFY0P(current_vd->vdev_checkpoint_sm);
 		}
 	}
 
@@ -9634,7 +9675,7 @@ main(int argc, char **argv)
 		} else if (objset_str && !zdb_numeric(objset_str + 1) &&
 		    dump_opt['N']) {
 			printf("Supply a numeric objset ID with -N\n");
-			error = 1;
+			error = 2;
 			goto fini;
 		}
 	} else {
@@ -9743,7 +9784,7 @@ main(int argc, char **argv)
 	if (error == 0) {
 		if (dump_opt['k'] && (target_is_spa || dump_opt['R'])) {
 			ASSERT(checkpoint_pool != NULL);
-			ASSERT(checkpoint_target == NULL);
+			ASSERT0P(checkpoint_target);
 
 			error = spa_open(checkpoint_pool, &spa, FTAG);
 			if (error != 0) {
@@ -9935,6 +9976,9 @@ fini:
 
 	if (kernel_init_done)
 		kernel_fini();
+
+	if (corruption_found && error == 0)
+		error = 3;
 
 	return (error);
 }

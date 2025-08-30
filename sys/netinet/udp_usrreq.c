@@ -448,7 +448,7 @@ udp_multi_input(struct mbuf *m, int proto, struct sockaddr_in *udp_in)
 		/*
 		 * No matching pcb found; discard datagram.  (No need
 		 * to send an ICMP Port Unreachable for a broadcast
-		 * or multicast datgram.)
+		 * or multicast datagram.)
 		 */
 		UDPSTAT_INC(udps_noport);
 		if (IN_MULTICAST(ntohl(ip->ip_dst.s_addr)))
@@ -654,7 +654,11 @@ udp_input(struct mbuf **mp, int *offp, int proto)
 		else
 			UDP_PROBE(receive, NULL, NULL, ip, NULL, uh);
 		UDPSTAT_INC(udps_noport);
-		if (m->m_flags & (M_BCAST | M_MCAST)) {
+		if (m->m_flags & M_MCAST) {
+			UDPSTAT_INC(udps_noportmcast);
+			goto badunlocked;
+		}
+		if (m->m_flags & M_BCAST) {
 			UDPSTAT_INC(udps_noportbcast);
 			goto badunlocked;
 		}
